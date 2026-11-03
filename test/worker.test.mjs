@@ -114,6 +114,41 @@ test('存储预算：最坏情况也不超过免费 1GB', async () => {
     assert.equal((await worker.fetch(uploadRequest(120 * 1024), env)).status, 200);
 });
 
+test('边缘缓存：命中缓存时不再读 KV', async () => {
+    const env = makeEnv();
+    const up = await (await worker.fetch(uploadRequest(120 * 1024), env)).json();
+
+    let kvReads = 0;
+    const realGet = env.SHARE_KV.getWithMetadata.bind(env.SHARE_KV);
+    env.SHARE_KV.getWithMetadata = async (k, t) => { kvReads++; return realGet(k, t); };
+
+    const cacheStore = new Map();
+    const original = globalThis.caches;
+    globalThis.caches = {
+        default: {
+            async match(req) { return cacheStore.get(req.url) || undefined; },
+            async put(req, res) { cacheStore.set(req.url, res); }
+        }
+    };
+    try {
+        const waited = [];
+        const ctx = { waitUntil: (p) => waited.push(p) };
+
+        const first = await worker.fetch(new Request(up.url), env, ctx);
+        assert.equal(first.status, 200);
+        await Promise.all(waited);
+        assert.equal(kvReads, 1, '首次请求读一次 KV');
+        assert.ok(cacheStore.has(up.url), '响应应写入边缘缓存');
+
+        const second = await worker.fetch(new Request(up.url), env, ctx);
+        assert.equal(second.status, 200);
+        assert.equal(kvReads, 1, '第二次命中缓存，KV 读次数不再增加');
+        assert.equal((await second.arrayBuffer()).byteLength, 120 * 1024);
+    } finally {
+        globalThis.caches = original;
+    }
+});
+
 test('其余路径交给静态资源', async () => {
     const res = await worker.fetch(new Request(ORIGIN + '/'), makeEnv());
     assert.match(await res.text(), /<html>/);

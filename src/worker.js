@@ -103,24 +103,44 @@ async function handleUpload(request, env, url) {
     return json({ ok: true, url: `${url.origin}/i/${id}` });
 }
 
-async function handleImage(env, id) {
+/*
+ * 取图：优先命中 Cloudflare 边缘缓存（Cache API），只有未命中才读 KV。
+ * 图片一旦写入就不变，可以放心长缓存 —— 这样即使某个链接被反复访问/转发，
+ * KV 读额度也不会被线性消耗（每个边缘节点只读一次）。
+ */
+async function handleImage(request, env, ctx, id) {
     if (!env.SHARE_KV) return new Response('Not Found', { status: 404 });
     if (!/^[0-9a-z]{4,16}$/.test(id)) return new Response('Not Found', { status: 404 });
+
+    const cache = typeof caches !== 'undefined' && caches.default ? caches.default : null;
+    const isGet = request.method === 'GET';
+    const cacheKey = cache && isGet ? new Request(request.url, { method: 'GET' }) : null;
+
+    if (cacheKey) {
+        const hit = await cache.match(cacheKey);
+        if (hit) return hit;
+    }
 
     const { value, metadata } = await env.SHARE_KV.getWithMetadata(`img:${id}`, 'arrayBuffer');
     if (!value) return new Response('Not Found', { status: 404 });
 
-    return new Response(value, {
+    const res = new Response(value, {
         headers: {
             'content-type': metadata?.type || 'image/webp',
             'cache-control': 'public, max-age=31536000, immutable',
             'access-control-allow-origin': '*'
         }
     });
+
+    if (cacheKey && ctx && typeof ctx.waitUntil === 'function') {
+        ctx.waitUntil(cache.put(cacheKey, res.clone()));
+    }
+
+    return res;
 }
 
 export default {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
         const url = new URL(request.url);
 
         try {
@@ -131,7 +151,7 @@ export default {
                 if (request.method !== 'GET' && request.method !== 'HEAD') {
                     return new Response('Method Not Allowed', { status: 405 });
                 }
-                return await handleImage(env, url.pathname.slice(3));
+                return await handleImage(request, env, ctx, url.pathname.slice(3));
             }
             return await env.ASSETS.fetch(request);
         } catch (e) {
