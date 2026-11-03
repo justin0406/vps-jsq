@@ -1,8 +1,8 @@
 这是一个简单美观的 VPS 剩余价值计算器，支持多种货币、自定义汇率，并可以生成精美的分享图片。
 
-![demo](./demo1.webp)
+![demo](./public/demo1.webp)
 
-![demo](./demo2.webp)
+![demo](./public/demo2.webp)
 
 ✨ **特性**：
 - 💰 支持多币种自动汇率转换 (USD, EUR, GBP, JPY 等)
