@@ -1,4 +1,5 @@
 import './style.css';
+import { computeRemaining } from './calc.js';
 
 // Firefox 检测：为 html 添加标识类，供 CSS 针对性处理原生控件差异
 if (typeof navigator !== 'undefined' && /firefox/i.test(navigator.userAgent)) {
@@ -59,6 +60,11 @@ const els = {
 let rateLimitTimer = null;
 let remainingValueCNY = 0;
 let quoteLastEdited = 'premium';
+// customRate 当前对应的币种。切币种后若拉不到新汇率，靠它判断「手上的汇率已经过期」，
+// 避免拿 A 币种的汇率去算 B 币种的金额。
+let rateCurrency = '';
+// 用户是否手动改过汇率：手动值刷新页面后应保留，不能被缓存汇率覆盖。
+let rateIsManual = false;
 
 window.addEventListener('DOMContentLoaded', () => {
     try {
@@ -80,10 +86,18 @@ function hideAppLoader() {
     const loader = document.getElementById('appLoader');
     if (!loader) return;
 
-    requestAnimationFrame(() => {
+    let done = false;
+    const dismiss = () => {
+        if (done) return;
+        done = true;
         loader.classList.add('is-hidden');
         window.setTimeout(() => loader.remove(), 180);
-    });
+    };
+
+    // 正常路径：等下一帧，避免首帧未绘制就隐藏造成闪白。
+    // 兜底：标签页在后台打开时 requestAnimationFrame 不触发，靠超时保证不卡在转圈。
+    requestAnimationFrame(dismiss);
+    window.setTimeout(dismiss, 400);
 }
 
 function setupEventListeners() {
@@ -91,6 +105,11 @@ function setupEventListeners() {
 
     [els.price, els.dueDate, els.tradeDate, els.customRate].forEach(el => el.addEventListener('input', () => {
         if (el.type === 'date') syncDateDisplay(el);
+        // 手动输入汇率：标记为手动值，并记下它属于当前币种
+        if (el === els.customRate) {
+            rateIsManual = els.customRate.value.trim() !== '';
+            rateCurrency = els.currency.value;
+        }
         calculate();
         debouncedSave();
     }));
@@ -108,6 +127,9 @@ function setupEventListeners() {
 
     els.currency.addEventListener('change', () => {
         updateCurrencySymbol();
+        // 换币种后旧汇率不再有效（手动值也一样），重新走一次自动获取
+        rateIsManual = false;
+        rateCurrency = '';
         initRates(); 
         calculate();
         saveInputsToCookie();
@@ -554,7 +576,9 @@ function saveInputsToCookie() {
         currency: els.currency.value,
         cycle: Array.from(els.cycles).find(r => r.checked)?.value || "365",
         dueDate: els.dueDate.value,
+        tradeDate: els.tradeDate.value,
         customRate: els.customRate.value,
+        rateIsManual,
         premium: els.premiumInput.value,
         salePrice: els.salePriceInput.value,
         quoteLastEdited
@@ -570,7 +594,13 @@ function loadInputsFromCookie() {
             if(data.price) els.price.value = data.price;
             if(data.currency) els.currency.value = data.currency;
             if(data.dueDate) els.dueDate.value = data.dueDate;
+            if(data.tradeDate) els.tradeDate.value = data.tradeDate;
             if(data.customRate) els.customRate.value = data.customRate;
+            // 手动改过的汇率要活过刷新，不能被缓存汇率覆盖
+            if(data.rateIsManual && data.customRate) {
+                rateIsManual = true;
+                rateCurrency = data.currency || els.currency.value;
+            }
             if(data.quoteLastEdited === 'sale' || data.quoteLastEdited === 'premium') {
                 quoteLastEdited = data.quoteLastEdited;
                 if (quoteLastEdited === 'sale' && data.salePrice) {
@@ -590,8 +620,16 @@ function loadInputsFromCookie() {
 
 async function initRates() {
     const base = els.currency.value;
+
+    // 用户手动填过汇率：不拿缓存值覆盖，只把归属币种对齐
+    if (rateIsManual && els.customRate.value.trim() !== '') {
+        rateCurrency = base;
+        calculate();
+        return;
+    }
+
     if (base === 'CNY') {
-        finishRateUpdate(1, "1.0000");
+        finishRateUpdate(1);
         return;
     }
 
@@ -601,7 +639,7 @@ async function initRates() {
     if (cachedData) {
         try {
             const data = JSON.parse(cachedData);
-            finishRateUpdate(data.rate, data.rate.toFixed(4));
+            finishRateUpdate(data.rate);
         } catch (e) {
             manualRefreshRate(false);
         }
@@ -655,7 +693,7 @@ async function fetchExchangeRate() {
             const baseInCNY = data.rates && data.rates[base];
             if (typeof baseInCNY === 'number' && baseInCNY > 0 && Number.isFinite(baseInCNY)) {
                 const rate = 1 / baseInCNY;
-                finishRateUpdate(rate, rate.toFixed(4));
+                finishRateUpdate(rate);
                 
                 const cacheData = JSON.stringify({ rate: rate, time: Date.now() });
                 setCookie(`vps_rate_${base}`, cacheData, RATE_CACHE_HOURS);
@@ -670,12 +708,22 @@ async function fetchExchangeRate() {
         console.error(error);
         els.apiRateDisplay.textContent = "汇率刷新";
         els.refreshIcon.classList.remove('spin');
-        showToast("获取汇率失败");
+        // 手上的汇率属于上一个币种：留着算出来的结果是错的，清空并提示手动填写
+        if (rateCurrency !== els.currency.value) {
+            els.customRate.value = '';
+            rateCurrency = '';
+            calculate();
+            showToast("获取汇率失败，请手动填写");
+        } else {
+            showToast("获取汇率失败");
+        }
     }
 }
 
-function finishRateUpdate(rate, text) {
+function finishRateUpdate(rate) {
     els.customRate.value = rate.toFixed(4);
+    rateCurrency = els.currency.value;
+    rateIsManual = false;
     els.apiRateDisplay.textContent = "汇率刷新";
     els.refreshIcon.classList.remove('spin');
     calculate();
@@ -721,7 +769,8 @@ function getNextBlackFriday(date) {
 
 function initDates() {
     const now = new Date();
-    els.tradeDate.value = formatDate(now);
+    // 交易日期同样要持久化：只有空值时才默认成今天
+    if (!els.tradeDate.value) els.tradeDate.value = formatDate(now);
     syncDateDisplay(els.tradeDate);
     if (els.dueDate.value) {
         syncDateDisplay(els.dueDate);
@@ -757,19 +806,26 @@ function calculate() {
     const rateRaw = parseFloat(els.customRate.value);
     const price = Number.isFinite(priceRaw) && priceRaw >= 0 ? priceRaw : 0;
     const rate = Number.isFinite(rateRaw) && rateRaw > 0 ? rateRaw : 0;
-    const due = new Date(els.dueDate.value);
-    const trade = new Date(els.tradeDate.value);
 
     let cycleDays = 365;
     for (const radio of els.cycles) {
-        if (radio.checked) { cycleDays = parseInt(radio.value); break; }
+        if (radio.checked) { cycleDays = parseInt(radio.value, 10); break; }
     }
 
     const totalCNY = price * rate;
     els.priceCNYPreview.textContent = `≈${totalCNY.toFixed(2)}元`;
 
+    // 计算全部收敛到 calc.js（纯函数，有单测覆盖）
+    const result = computeRemaining({
+        price,
+        rate,
+        cycleDays,
+        tradeDate: els.tradeDate.value,
+        dueDate: els.dueDate.value
+    });
+
     // 空 / 非法日期：清空结果区，给出占位提示
-    if (isNaN(due.getTime()) || isNaN(trade.getTime())) {
+    if (!result) {
         remainingValueCNY = 0;
         setFinalValueDisplay('0.00');
         els.originalCurrencyValue.textContent = '请填写到期日 / 交易日';
@@ -780,37 +836,19 @@ function calculate() {
         return;
     }
 
-    const diffTime = due - trade;
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-    const dailyPrice = cycleDays > 0 ? price / cycleDays : 0;
+    els.progressBar.style.width = `${result.barPct}%`;
+    remainingValueCNY = result.valueCNY;
+    setFinalValueDisplay(result.valueCNY.toFixed(2));
 
-    let valOrig = 0, valCNY = 0;
-
-    if (diffDays > 0) {
-        valOrig = dailyPrice * diffDays;
-        valCNY = valOrig * rate;
-    }
-
-    // 进度条语义：当前续费周期内的「剩余比例」，文案显示按总剩余天数 / 周期取整。
-    let progressPct;
-    let displayProgressPct;
-    if (diffDays <= 0) {
-        progressPct = 0;
-        displayProgressPct = 0;
-    } else if (diffDays >= cycleDays) {
-        progressPct = 100;
-        displayProgressPct = Math.round((diffDays / cycleDays) * 100);
+    // 汇率为空（如切币种后拉取失败）：提示补汇率，而不是给出 0 元
+    if (rate === 0 && price > 0 && els.currency.value !== 'CNY') {
+        els.originalCurrencyValue.textContent = '请填写汇率';
     } else {
-        displayProgressPct = Math.max(1, Math.round((diffDays / cycleDays) * 100));
-        progressPct = displayProgressPct;
+        els.originalCurrencyValue.textContent = `≈ ${result.valueOrig.toFixed(2)} ${els.currency.value}`;
     }
 
-    els.progressBar.style.width = `${progressPct}%`;
-    remainingValueCNY = valCNY;
-    setFinalValueDisplay(valCNY.toFixed(2));
-    els.originalCurrencyValue.textContent = `≈ ${valOrig.toFixed(2)} ${els.currency.value}`;
-    els.daysRemaining.textContent = diffDays > 0 ? diffDays : '0';
-    els.progressText.textContent = `${displayProgressPct}%`;
+    els.daysRemaining.textContent = result.days > 0 ? result.days : '0';
+    els.progressText.textContent = `${result.labelPct}%`;
     syncQuoteFields();
 }
 
@@ -929,7 +967,6 @@ modal.el.addEventListener('click', (e) => {
 });
 
 async function generateImage() {
-    console.log('generateImage called');
     
     // Show modal immediately to indicate processing
     modal.el.classList.remove('hidden');
@@ -982,7 +1019,6 @@ async function generateImage() {
             resetGeneratedImage();
             generatedImageUrl = URL.createObjectURL(blob);
 
-            console.log('Image generated successfully');
             modal.loading.classList.add('hidden');
             modal.img.src = generatedImageUrl;
             modal.img.classList.remove('hidden');
