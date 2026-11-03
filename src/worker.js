@@ -10,16 +10,18 @@
  * 未绑定 SHARE_KV 时，/api/share 一律返回 ok:false（站点本身不受影响）。
  */
 
-const MAX_BYTES = 1.5 * 1024 * 1024;
+// 单图上限 512KB：前端实测导出 84~120KB，留 4 倍余量；
+// 同时保证「日上限 × 保留天数 × 单图上限」不超过免费 1GB（20 × 90 × 512KB ≈ 900MB）
+const MAX_BYTES = 512 * 1024;
 const MIN_BYTES = 1024;
 // 保留 90 天：分享链接够用，同时把存储上限锁在「全站日上限 × 90 × 单图体积」。
-// 免费版 KV 只有 1GB，实测分享图 84~120KB，30 张/天 × 90 天 ≈ 330MB，留足余量。
+// 免费版 KV 只有 1GB，实测分享图 84~120KB，正常用量 90 天约 100~200MB。
 const TTL_SECONDS = 90 * 24 * 60 * 60;
 const ALLOWED_TYPES = new Set(['image/webp', 'image/png', 'image/jpeg']);
 // 单 IP 每天 10 张：正常自己用远超不出，脚本刷的话单 IP 伤害有限
 const RATE_LIMIT_PER_IP_PER_DAY = 10;
-// 全站每天 30 张：兜底闸门，即使被大量不同 IP 刷，也只会产生约 3.6MB/天
-const DAILY_UPLOAD_CAP = 30;
+// 全站每天 20 张：兜底闸门。20 × 90 天 × 512KB ≈ 900MB，硬上限锁死在免费 1GB 内
+const DAILY_UPLOAD_CAP = 20;
 
 function json(body, status = 200) {
     return new Response(JSON.stringify(body), {
@@ -63,11 +65,11 @@ async function handleUpload(request, env, url) {
     }
 
     const declared = Number(request.headers.get('content-length') || 0);
-    if (declared > MAX_BYTES) return json({ ok: false, error: '图片过大（上限 1.5MB）' }, 413);
+    if (declared > MAX_BYTES) return json({ ok: false, error: '图片过大（上限 512KB）' }, 413);
 
     const buf = await request.arrayBuffer();
     if (buf.byteLength < MIN_BYTES) return json({ ok: false, error: '图片为空' }, 400);
-    if (buf.byteLength > MAX_BYTES) return json({ ok: false, error: '图片过大（上限 1.5MB）' }, 413);
+    if (buf.byteLength > MAX_BYTES) return json({ ok: false, error: '图片过大（上限 512KB）' }, 413);
 
     // 两道限额：单 IP 每天 10 张 + 全站每天 30 张，防止被脚本刷爆免费额度
     const day = new Date().toISOString().slice(0, 10);
