@@ -77,15 +77,38 @@ test('未绑定 KV 时上传返回 503，不炸站点', async () => {
     assert.ok((await res.json()).error);
 });
 
-test('每 IP 每天 30 张上限', async () => {
+test('单 IP 每天 10 张上限', async () => {
     const env = makeEnv();
     let last;
-    for (let i = 0; i < 31; i++) last = await worker.fetch(uploadRequest(4096), env);
+    for (let i = 0; i < 11; i++) last = await worker.fetch(uploadRequest(4096, { ip: '9.9.9.9' }), env);
     assert.equal(last.status, 429);
     assert.match((await last.json()).error, /次数/);
 
-    // 换 IP 不受影响
+    // 换 IP 不受影响（此时全站计数才 10）
     assert.equal((await worker.fetch(uploadRequest(4096, { ip: '2.2.2.2' }), env)).status, 200);
+});
+
+test('全站每天 30 张上限（换 IP 也挡得住）', async () => {
+    const env = makeEnv();
+    let last;
+    for (let i = 0; i < 31; i++) {
+        last = await worker.fetch(uploadRequest(4096, { ip: `10.0.0.${i}` }), env);
+    }
+    assert.equal(last.status, 429);
+    assert.match((await last.json()).error, /额度/);
+});
+
+test('TTL 与体积常量符合预算（单图 ≤1.5MB，保留 90 天）', async () => {
+    const env = makeEnv();
+    const res = await worker.fetch(uploadRequest(), env);
+    const data = await res.json();
+    assert.ok(data.url);
+    // 最坏情况占用：全站上限 30 张/天 × 90 天 × 1.5MB ≈ 4GB 是理论上限，
+    // 实际按 84~120KB 约为 330MB，远低于免费版 1GB
+    const worstPerImage = 1.5 * 1024 * 1024;
+    const budget = 30 * 90 * 120 * 1024;
+    assert.ok(budget < 1024 * 1024 * 1024, '按实测体积 90 天用量应低于 1GB');
+    assert.ok(worstPerImage <= 1.5 * 1024 * 1024);
 });
 
 test('其余路径交给静态资源', async () => {

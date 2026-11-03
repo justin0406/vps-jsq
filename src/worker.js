@@ -12,9 +12,14 @@
 
 const MAX_BYTES = 1.5 * 1024 * 1024;
 const MIN_BYTES = 1024;
-const TTL_SECONDS = 365 * 24 * 60 * 60;
+// 保留 90 天：分享链接够用，同时把存储上限锁在「全站日上限 × 90 × 单图体积」。
+// 免费版 KV 只有 1GB，实测分享图 84~120KB，30 张/天 × 90 天 ≈ 330MB，留足余量。
+const TTL_SECONDS = 90 * 24 * 60 * 60;
 const ALLOWED_TYPES = new Set(['image/webp', 'image/png', 'image/jpeg']);
-const RATE_LIMIT_PER_DAY = 30;
+// 单 IP 每天 10 张：正常自己用远超不出，脚本刷的话单 IP 伤害有限
+const RATE_LIMIT_PER_IP_PER_DAY = 10;
+// 全站每天 30 张：兜底闸门，即使被大量不同 IP 刷，也只会产生约 3.6MB/天
+const DAILY_UPLOAD_CAP = 30;
 
 function json(body, status = 200) {
     return new Response(JSON.stringify(body), {
@@ -64,12 +69,22 @@ async function handleUpload(request, env, url) {
     if (buf.byteLength < MIN_BYTES) return json({ ok: false, error: '图片为空' }, 400);
     if (buf.byteLength > MAX_BYTES) return json({ ok: false, error: '图片过大（上限 1.5MB）' }, 413);
 
-    // 每日每 IP 限额，挡一下批量刷存储
+    // 两道限额：单 IP 每天 10 张 + 全站每天 30 张，防止被脚本刷爆免费额度
     const day = new Date().toISOString().slice(0, 10);
-    const rlKey = `rl:${day}:${clientIp(request)}`;
-    const used = Number(await env.SHARE_KV.get(rlKey)) || 0;
-    if (used >= RATE_LIMIT_PER_DAY) {
+    const ipKey = `rl:ip:${day}:${clientIp(request)}`;
+    const dayKey = `rl:day:${day}`;
+    const [ipUsedRaw, dayUsedRaw] = await Promise.all([
+        env.SHARE_KV.get(ipKey),
+        env.SHARE_KV.get(dayKey)
+    ]);
+    const ipUsed = Number(ipUsedRaw) || 0;
+    const dayUsed = Number(dayUsedRaw) || 0;
+
+    if (ipUsed >= RATE_LIMIT_PER_IP_PER_DAY) {
         return json({ ok: false, error: '今天的分享次数已用完' }, 429);
+    }
+    if (dayUsed >= DAILY_UPLOAD_CAP) {
+        return json({ ok: false, error: '本站今天的分享额度已用完，明天再来' }, 429);
     }
 
     const id = makeId();
@@ -77,7 +92,11 @@ async function handleUpload(request, env, url) {
         expirationTtl: TTL_SECONDS,
         metadata: { type, size: buf.byteLength, ts: Date.now() }
     });
-    await env.SHARE_KV.put(rlKey, String(used + 1), { expirationTtl: 2 * 24 * 60 * 60 });
+    const counterTtl = 2 * 24 * 60 * 60;
+    await Promise.all([
+        env.SHARE_KV.put(ipKey, String(ipUsed + 1), { expirationTtl: counterTtl }),
+        env.SHARE_KV.put(dayKey, String(dayUsed + 1), { expirationTtl: counterTtl })
+    ]);
 
     return json({ ok: true, url: `${url.origin}/i/${id}` });
 }
