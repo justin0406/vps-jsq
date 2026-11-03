@@ -24,6 +24,11 @@ const SHARE_IMAGE_LOW_END_MAX_PIXEL_RATIO = 3;
 const SHARE_IMAGE_MIN_WIDTH = 1440;
 let htmlToImageModulePromise = null;
 let generatedImageUrl = '';
+// 当前生成的图片字节：上传分享时直接复用，不用再从 blob URL 取一遍
+let generatedImageBlob = null;
+// 已上传得到的分享链接，重复点「复制链接」不重复占存储
+let sharedImageUrl = '';
+const SHARE_BTN_DEFAULT_TEXT = '复制图片链接';
 
 const currencySymbols = {
     'USD': '$', 'EUR': '\u20AC', 'GBP': '\u00A3', 'JPY': '\u00A5',
@@ -54,7 +59,8 @@ const els = {
     toast: document.getElementById('toast'),
     rateLimitTip: document.getElementById('rateLimitTip'),
     themeToggle: document.getElementById('themeToggle'),
-    themeToggleKnob: document.getElementById('themeToggleKnob')
+    themeToggleKnob: document.getElementById('themeToggleKnob'),
+    copyLinkBtn: document.getElementById('copyLinkBtn')
 };
 
 let rateLimitTimer = null;
@@ -400,6 +406,8 @@ function resetGeneratedImage() {
         URL.revokeObjectURL(generatedImageUrl);
     }
     generatedImageUrl = '';
+    generatedImageBlob = null;
+    sharedImageUrl = '';
 }
 
 function formatDateForDisplay(value) {
@@ -1018,6 +1026,7 @@ async function generateImage() {
             const blob = await canvasToBlob(canvas, SHARE_IMAGE_MIME_TYPE, SHARE_IMAGE_QUALITY);
             resetGeneratedImage();
             generatedImageUrl = URL.createObjectURL(blob);
+            generatedImageBlob = blob;
 
             modal.loading.classList.add('hidden');
             modal.img.src = generatedImageUrl;
@@ -1039,6 +1048,70 @@ async function generateImage() {
     }, 100);
 }
 
+/*
+ * 分享图服务：/api/share 由 Worker 提供（KV 存储，1 年过期）。
+ * 未配置 KV 时健康检查返回 ok:false，按钮保持隐藏，页面其它功能不受影响。
+ */
+async function initShareSupport() {
+    const btn = els.copyLinkBtn;
+    if (!btn) return;
+    try {
+        const res = await fetch('/api/share', { headers: { accept: 'application/json' } });
+        const data = await res.json();
+        if (data && data.ok) btn.classList.remove('hidden');
+    } catch (_) {
+        // 本地 vite dev 或后端未部署：静默隐藏
+    }
+}
+
+function flashLinkButton(text) {
+    const btn = els.copyLinkBtn;
+    if (!btn) return;
+    const label = btn.querySelector('span');
+    if (!label) return;
+    label.textContent = text;
+    clearTimeout(flashLinkButton._t);
+    flashLinkButton._t = setTimeout(() => {
+        label.textContent = SHARE_BTN_DEFAULT_TEXT;
+    }, 1800);
+}
+
+async function shareGeneratedImage() {
+    const btn = els.copyLinkBtn;
+    const label = btn && btn.querySelector('span');
+    if (!btn || !label) return;
+
+    // 已经传过：直接复用链接，重复点击不再占存储
+    if (sharedImageUrl) {
+        copyTextToClipboard(sharedImageUrl, () => flashLinkButton('链接已复制 ✓'));
+        return;
+    }
+    if (!generatedImageBlob) return;
+
+    const originalText = label.textContent;
+    btn.disabled = true;
+    label.textContent = '上传中…';
+
+    try {
+        const res = await fetch('/api/share', {
+            method: 'POST',
+            headers: { 'content-type': generatedImageBlob.type || SHARE_IMAGE_MIME_TYPE },
+            body: generatedImageBlob
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data || !data.url) {
+            throw new Error((data && data.error) || `HTTP ${res.status}`);
+        }
+        sharedImageUrl = data.url;
+        copyTextToClipboard(sharedImageUrl, () => flashLinkButton('链接已复制 ✓'));
+    } catch (e) {
+        console.error('share failed', e);
+        label.textContent = originalText;
+        btn.disabled = false;
+        flashLinkButton('上传失败，请长按保存');
+    }
+}
+
 // 用 addEventListener 绑定（替代 inline onclick），保持 HTML 与逻辑解耦
 function bindActionButtons() {
     const map = [
@@ -1049,6 +1122,11 @@ function bindActionButtons() {
     for (const [id, fn] of map) {
         const el = document.getElementById(id);
         if (el) el.addEventListener('click', fn);
+    }
+
+    if (els.copyLinkBtn) {
+        els.copyLinkBtn.addEventListener('click', shareGeneratedImage);
+        initShareSupport();
     }
 
     // 鼠标悬停 / 键盘聚焦时预热 html-to-image，点击瞬间减少等待。仅触发一次。

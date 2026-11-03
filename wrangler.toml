@@ -5,3 +5,10 @@ main = "src/worker.js"
 [assets]
 directory = "dist"
 binding = "ASSETS"
+
+# 分享图存储（可选功能）：在 Cloudflare 后台 Storage & databases → KV 创建命名空间
+# （例如 vps-jsq-share），把 ID 填进来并取消下面两行注释，重新部署即可启用
+# 「复制图片链接」。未配置时该按钮自动隐藏，站点其余功能不受影响。
+# [[kv_namespaces]]
+# binding = "SHARE_KV"
+# id = "填你的 KV namespace id"

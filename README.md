@@ -9,6 +9,7 @@
 - 📅 自动计算剩余天数和金额
 - 🎨 支持深色/浅色模式切换
 - 🖼️ **一键生成交易卡片图片** (纯前端生成，无隐私泄露)
+- 🔗 **图片可复制为直链分享**（可选，需配置 Cloudflare KV，见下文）
 - 📱 适配移动端和 PC 端
 
 ---
@@ -35,6 +36,20 @@ npx wrangler deploy
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/verkyer/vps-jsq)
 
+## 🔗 图片直链分享（可选）
+
+生成分享图后，预览框里会出现「复制图片链接」按钮：图片上传到 Cloudflare KV，得到
+`https://<你的域名>/i/<id>` 这样的直链，可直接贴到聊天里，1 年后自动过期。
+
+启用步骤：
+
+1. Cloudflare 后台 → **Storage & databases → KV** → Create namespace（如 `vps-jsq-share`），复制其 ID；
+2. 把 ID 填进 `wrangler.toml`，取消 `[[kv_namespaces]]` 三行的注释；
+3. 重新部署。
+
+未配置时按钮自动隐藏，站点其余功能不受影响。接口限制：单图 ≤1.5MB、仅 webp/png/jpeg、
+每 IP 每天 30 张（KV 免费额度为每天 1000 次写入 / 10 万次读取、1GB 存储）。
+
 ## 🛠️ 开发与构建
 
 本项目使用 Vite + Tailwind CSS 构建。
@@ -52,6 +67,11 @@ npx wrangler deploy
 3. 构建生产环境代码（生成 `dist/` 目录）：
    ```bash
    npm run build
+   ```
+
+4. 跑测试（计算逻辑 + Worker 接口冒烟）：
+   ```bash
+   npm test
    ```
 
 ---
