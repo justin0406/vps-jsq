@@ -118,7 +118,12 @@ async function handleImage(request, env, ctx, id) {
 
     if (cacheKey) {
         const hit = await cache.match(cacheKey);
-        if (hit) return hit;
+        if (hit) {
+            // 便于排查：hit 表示这次没读 KV
+            const headers = new Headers(hit.headers);
+            headers.set('x-share-cache', 'hit');
+            return new Response(hit.body, { status: hit.status, headers });
+        }
     }
 
     const { value, metadata } = await env.SHARE_KV.getWithMetadata(`img:${id}`, 'arrayBuffer');
@@ -128,7 +133,8 @@ async function handleImage(request, env, ctx, id) {
         headers: {
             'content-type': metadata?.type || 'image/webp',
             'cache-control': 'public, max-age=31536000, immutable',
-            'access-control-allow-origin': '*'
+            'access-control-allow-origin': '*',
+            'x-share-cache': 'miss'
         }
     });
 
