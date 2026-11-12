@@ -15,6 +15,7 @@ const SHARE_IMAGE_MIME_TYPE = 'image/webp';
 const SHARE_IMAGE_QUALITY = 0.98;
 // 上传体积上限：与服务端 MAX_BYTES（512KB）对齐，留一点余量
 const SHARE_UPLOAD_MAX_BYTES = 500 * 1024;
+const SHARE_IMAGE_ALT = 'VPS 剩余价值';
 // 导出图片的最低像素比与目标物理宽度。手机端 CSS 宽度通常仅 ~360px，
 // 若固定 pixelRatio=2 输出仅 ~720px 会发糊。这里按卡片实际 CSS 宽度动态
 // 计算 pixelRatio，保证输出至少 SHARE_IMAGE_MIN_WIDTH 物理像素宽。
@@ -30,7 +31,6 @@ let generatedImageUrl = '';
 let generatedImageBlob = null;
 // 已上传得到的分享链接，重复点「复制链接」不重复占存储
 let sharedImageUrl = '';
-const SHARE_BTN_DEFAULT_TEXT = '复制图片链接';
 
 const currencySymbols = {
     'USD': '$', 'EUR': '\u20AC', 'GBP': '\u00A3', 'JPY': '\u00A5',
@@ -62,7 +62,8 @@ const els = {
     rateLimitTip: document.getElementById('rateLimitTip'),
     themeToggle: document.getElementById('themeToggle'),
     themeToggleKnob: document.getElementById('themeToggleKnob'),
-    copyLinkBtn: document.getElementById('copyLinkBtn')
+    copyLinkBtn: document.getElementById('copyLinkBtn'),
+    copyMdBtn: document.getElementById('copyMdBtn')
 };
 
 let rateLimitTimer = null;
@@ -1093,65 +1094,92 @@ async function generateImage() {
  * 未配置 KV 时健康检查返回 ok:false，按钮保持隐藏，页面其它功能不受影响。
  */
 async function initShareSupport() {
-    const btn = els.copyLinkBtn;
-    if (!btn) return;
+    const buttons = [els.copyLinkBtn, els.copyMdBtn].filter(Boolean);
+    if (!buttons.length) return;
     try {
         const res = await fetch('/api/share', { headers: { accept: 'application/json' } });
         const data = await res.json();
-        if (data && data.ok) btn.classList.remove('hidden');
+        if (data && data.ok) buttons.forEach((btn) => btn.classList.remove('hidden'));
     } catch (_) {
         // 本地 vite dev 或后端未部署：静默隐藏
     }
 }
 
-function flashLinkButton(text) {
-    const btn = els.copyLinkBtn;
-    if (!btn) return;
-    const label = btn.querySelector('span');
+// 上传当前图片并返回直链；已上传过则直接复用
+async function ensureShareUrl() {
+    if (sharedImageUrl) return sharedImageUrl;
+    if (!generatedImageBlob) throw new Error('请先生成图片');
+
+    const res = await fetch('/api/share', {
+        method: 'POST',
+        headers: { 'content-type': generatedImageBlob.type || 'image/jpeg' },
+        body: generatedImageBlob
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data || !data.url) {
+        throw new Error((data && data.error) || `HTTP ${res.status}`);
+    }
+    sharedImageUrl = data.url;
+    return sharedImageUrl;
+}
+
+/*
+ * 分享按钮共用流程：确保图片已上传 → 生成目标文本 → 复制 → 给出反馈。
+ * 上传只做一次，两个按钮共用同一个直链。
+ */
+const SHARE_BTN_TEXT = {
+    copyLinkBtn: '复制图片链接',
+    copyMdBtn: '复制 Markdown'
+};
+
+function setShareButtonsBusy(busy) {
+    Object.keys(SHARE_BTN_TEXT).forEach((id) => {
+        const btn = els[id];
+        if (btn) btn.disabled = !!busy;
+    });
+}
+
+function flashShareButton(btn, text) {
+    const label = btn && btn.querySelector('span');
     if (!label) return;
     label.textContent = text;
-    clearTimeout(flashLinkButton._t);
-    flashLinkButton._t = setTimeout(() => {
-        label.textContent = SHARE_BTN_DEFAULT_TEXT;
+    clearTimeout(btn._flashTimer);
+    btn._flashTimer = setTimeout(() => {
+        label.textContent = SHARE_BTN_TEXT[btn.id] || '复制';
     }, 1800);
 }
 
-async function shareGeneratedImage() {
-    const btn = els.copyLinkBtn;
-    const label = btn && btn.querySelector('span');
-    if (!btn || !label) return;
+async function copyShareContent(btn, buildText, doneText) {
+    if (!btn) return;
+    const label = btn.querySelector('span');
 
-    // 已经传过：直接复用链接，重复点击不再占存储
-    if (sharedImageUrl) {
-        copyTextToClipboard(sharedImageUrl, () => flashLinkButton('链接已复制 ✓'));
-        return;
+    if (!sharedImageUrl) {
+        setShareButtonsBusy(true);
+        if (label) label.textContent = '上传中…';
     }
-    if (!generatedImageBlob) return;
-
-    const originalText = label.textContent;
-    btn.disabled = true;
-    label.textContent = '上传中…';
 
     try {
-        const res = await fetch('/api/share', {
-            method: 'POST',
-            headers: { 'content-type': generatedImageBlob.type || 'image/jpeg' },
-            body: generatedImageBlob
-        });
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data || !data.url) {
-            throw new Error((data && data.error) || `HTTP ${res.status}`);
-        }
-        sharedImageUrl = data.url;
-        copyTextToClipboard(sharedImageUrl, () => flashLinkButton('链接已复制 ✓'));
+        const url = await ensureShareUrl();
+        copyTextToClipboard(buildText(url), () => flashShareButton(btn, doneText));
     } catch (e) {
         console.error('share failed', e);
-        label.textContent = originalText;
-        btn.disabled = false;
-        // 把服务端给的原因（如「图片过大」）透出来，别只提示「失败」
         const reason = e && e.message ? String(e.message) : '上传失败';
-        flashLinkButton(reason.length > 16 ? reason.slice(0, 16) : reason);
+        flashShareButton(btn, reason.length > 16 ? reason.slice(0, 16) : reason);
+    } finally {
+        setShareButtonsBusy(false);
+        if (label && label.textContent === '上传中…') {
+            label.textContent = SHARE_BTN_TEXT[btn.id] || '复制';
+        }
     }
+}
+
+function shareGeneratedImage() {
+    return copyShareContent(els.copyLinkBtn, (url) => url, '链接已复制 ✓');
+}
+
+// 图片的 Markdown 引用：![VPS 剩余价值](https://jsq.343177.xyz/i/xxx)
+function copyImageMarkdown() {
+    return copyShareContent(els.copyMdBtn, (url) => `![${SHARE_IMAGE_ALT}](${url})`, '已复制 ✓');
 }
 
 // 用 addEventListener 绑定（替代 inline onclick），保持 HTML 与逻辑解耦
@@ -1166,10 +1194,9 @@ function bindActionButtons() {
         if (el) el.addEventListener('click', fn);
     }
 
-    if (els.copyLinkBtn) {
-        els.copyLinkBtn.addEventListener('click', shareGeneratedImage);
-        initShareSupport();
-    }
+    if (els.copyLinkBtn) els.copyLinkBtn.addEventListener('click', shareGeneratedImage);
+    if (els.copyMdBtn) els.copyMdBtn.addEventListener('click', copyImageMarkdown);
+    if (els.copyLinkBtn || els.copyMdBtn) initShareSupport();
 
     // 鼠标悬停 / 键盘聚焦时预热 html-to-image，点击瞬间减少等待。仅触发一次。
     const imgBtn = document.getElementById('imgBtn');
