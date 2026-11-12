@@ -13,6 +13,8 @@ const RATE_CACHE_HOURS = 12;
 const MANUAL_REFRESH_LIMIT = 2;
 const SHARE_IMAGE_MIME_TYPE = 'image/webp';
 const SHARE_IMAGE_QUALITY = 0.98;
+// 上传体积上限：与服务端 MAX_BYTES（512KB）对齐，留一点余量
+const SHARE_UPLOAD_MAX_BYTES = 500 * 1024;
 // 导出图片的最低像素比与目标物理宽度。手机端 CSS 宽度通常仅 ~360px，
 // 若固定 pixelRatio=2 输出仅 ~720px 会发糊。这里按卡片实际 CSS 宽度动态
 // 计算 pixelRatio，保证输出至少 SHARE_IMAGE_MIN_WIDTH 物理像素宽。
@@ -399,6 +401,44 @@ function canvasToBlob(canvas, type, quality) {
             }
         }, type, quality);
     });
+}
+
+/*
+ * 生成用于展示/保存/上传的图片二进制。
+ *
+ * 注意：不支持 WebP 编码的浏览器（Safari 的 canvas.toBlob('image/webp')）会
+ * 静默返回 PNG —— 一张卡片 PNG 约 1.8MB，既超上传上限也浪费流量。所以这里
+ * 逐级降级：WebP → JPEG(0.92/0.85/0.78/0.7) → 缩到 70% 再试，保证结果 ≤ 500KB。
+ */
+async function encodeCardImage(canvas) {
+    const limit = SHARE_UPLOAD_MAX_BYTES;
+
+    try {
+        const blob = await canvasToBlob(canvas, SHARE_IMAGE_MIME_TYPE, SHARE_IMAGE_QUALITY);
+        if (blob.type === SHARE_IMAGE_MIME_TYPE && blob.size <= limit) return blob;
+    } catch (_) { /* 落到 JPEG */ }
+
+    for (const quality of [0.92, 0.85, 0.78, 0.7]) {
+        try {
+            const blob = await canvasToBlob(canvas, 'image/jpeg', quality);
+            if (blob.size <= limit) return blob;
+        } catch (_) { /* 继续降 */ }
+    }
+
+    const scaled = document.createElement('canvas');
+    scaled.width = Math.max(1, Math.round(canvas.width * 0.7));
+    scaled.height = Math.max(1, Math.round(canvas.height * 0.7));
+    scaled.getContext('2d').drawImage(canvas, 0, 0, scaled.width, scaled.height);
+
+    for (const quality of [0.85, 0.75]) {
+        try {
+            const blob = await canvasToBlob(scaled, 'image/jpeg', quality);
+            if (blob.size <= limit) return blob;
+        } catch (_) { /* 继续降 */ }
+    }
+
+    // 兜底：交原图 JPEG 0.7，让服务端给出明确拒绝原因
+    return canvasToBlob(canvas, 'image/jpeg', 0.7);
 }
 
 function resetGeneratedImage() {
@@ -1023,7 +1063,7 @@ async function generateImage() {
                     transform: 'scale(1)',
                 }
             });
-            const blob = await canvasToBlob(canvas, SHARE_IMAGE_MIME_TYPE, SHARE_IMAGE_QUALITY);
+            const blob = await encodeCardImage(canvas);
             resetGeneratedImage();
             generatedImageUrl = URL.createObjectURL(blob);
             generatedImageBlob = blob;
@@ -1095,7 +1135,7 @@ async function shareGeneratedImage() {
     try {
         const res = await fetch('/api/share', {
             method: 'POST',
-            headers: { 'content-type': generatedImageBlob.type || SHARE_IMAGE_MIME_TYPE },
+            headers: { 'content-type': generatedImageBlob.type || 'image/jpeg' },
             body: generatedImageBlob
         });
         const data = await res.json().catch(() => null);
@@ -1108,7 +1148,9 @@ async function shareGeneratedImage() {
         console.error('share failed', e);
         label.textContent = originalText;
         btn.disabled = false;
-        flashLinkButton('上传失败，请长按保存');
+        // 把服务端给的原因（如「图片过大」）透出来，别只提示「失败」
+        const reason = e && e.message ? String(e.message) : '上传失败';
+        flashLinkButton(reason.length > 16 ? reason.slice(0, 16) : reason);
     }
 }
 
