@@ -34,7 +34,7 @@ npx wrangler deploy
 ```
 #### 一键 Cloudflare 部署：
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/verkyer/vps-jsq)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/justin0406/vps-jsq)
 
 ## 🔗 图片直链分享（可选）
 
@@ -48,18 +48,20 @@ npx wrangler deploy
 启用步骤：
 
 1. Cloudflare 后台 → **Storage & databases → KV** → Create namespace（如 `vps-jsq-share`），复制其 ID；
-2. 把 ID 填进 `wrangler.toml`，取消 `[[kv_namespaces]]` 三行的注释；
+2. 把 ID 填进 `wrangler.toml` 的 `[[kv_namespaces]]` 段（本仓库已预填自己的 namespace，换用你自己的时替换 `id` 即可）；
 3. 重新部署。
 
 未配置时按钮自动隐藏，站点其余功能不受影响。
 
 接口限制：单图 ≤512KB、仅 webp/png/jpeg、单 IP 每天 10 张、全站每天 20 张，图片保留 90 天。
-按这个组合，存储硬上限 = 20 × 90 × 512KB ≈ 900MB，仍在 KV 免费额度（1GB 存储 / 每天 1000 次写入 /
+按这个组合，存储用量按 20 × 90 × 512KB ≈ 900MB 估算，仍在 KV 免费额度（1GB 存储 / 每天 1000 次写入 /
 10 万次读取）之内；实际导出图 84~120KB，正常使用 90 天只占 100~200MB。
+注意两点：① 全站每日额度是 KV 计数器实现的**软上限**（并发读写可能漏计数），主防护靠单 IP 限额；
+② 图片链接的边缘缓存期与 90 天 TTL 对齐，但个别边缘节点可能在 TTL 过期后短暂继续提供副本。
 
 费用：Workers **Free 计划**下 KV 超额只会让接口报错（功能当日不可用，UTC 0 点重置），不会产生任何费用。
 只有主动升级到 Workers Paid 后，超出部分才计费（约 $0.50/百万次读、$5/百万次写、$0.50/GB·月），
-按上面的硬上限即使跑满每月也不到 1 美元。
+按上面的用量估算即使跑满每月也不到 1 美元。
 
 ## 🛠️ 开发与构建
 

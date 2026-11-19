@@ -51,7 +51,8 @@ test('上传 → 取图：字节一致，长缓存，CORS 放开', async () => {
     const got = await worker.fetch(new Request(data.url), env);
     assert.equal(got.status, 200);
     assert.equal(got.headers.get('content-type'), 'image/webp');
-    assert.match(got.headers.get('cache-control'), /immutable/);
+    // 缓存期与 KV TTL（90 天）对齐：KV 条目过期后边缘缓存不应继续提供副本
+    assert.match(got.headers.get('cache-control'), /max-age=7776000,\s*immutable/);
     assert.equal(got.headers.get('access-control-allow-origin'), '*');
     assert.equal((await got.arrayBuffer()).byteLength, 200 * 1024);
 });
@@ -152,4 +153,36 @@ test('边缘缓存：命中缓存时不再读 KV', async () => {
 test('其余路径交给静态资源', async () => {
     const res = await worker.fetch(new Request(ORIGIN + '/'), makeEnv());
     assert.match(await res.text(), /<html>/);
+});
+
+// chunked 请求没有 content-length：老实现靠 arrayBuffer() 全量缓冲后才校验大小，
+// 超限 body 会被整个读进内存。新实现流式累计、超限立即 abort。
+function chunkedRequest(totalBytes, chunkBytes = 64 * 1024) {
+    let sent = 0;
+    const stream = new ReadableStream({
+        pull(controller) {
+            if (sent >= totalBytes) { controller.close(); return; }
+            const n = Math.min(chunkBytes, totalBytes - sent);
+            controller.enqueue(new Uint8Array(n));
+            sent += n;
+        }
+    });
+    return new Request(ORIGIN + '/api/share', {
+        method: 'POST',
+        body: stream,
+        duplex: 'half',
+        headers: { 'content-type': 'image/webp', origin: ORIGIN, 'cf-connecting-ip': '5.5.5.5' }
+    });
+}
+
+test('chunked 上传（无 content-length）：超限立即 413', async () => {
+    const env = makeEnv();
+    const over = await worker.fetch(chunkedRequest(600 * 1024), env);
+    assert.equal(over.status, 413);
+    assert.match((await over.json()).error, /过大/);
+
+    // 正常体积的 chunked 上传仍然成功
+    const ok = await worker.fetch(chunkedRequest(120 * 1024), env);
+    assert.equal(ok.status, 200);
+    assert.ok((await ok.json()).url);
 });

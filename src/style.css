@@ -991,3 +991,21 @@ html.dark #mainCard.exporting #resultCard {
 .spin {
     animation: spin 1s linear infinite;
 }
+
+/* 键盘焦点：周期单选是 sr-only，焦点环画在对应的选中卡片上 */
+.cycle-radio:focus-visible + .cycle-option {
+    outline: 2px solid #f59e0b;
+    outline-offset: 2px;
+}
+
+/* 用户偏好减少动效：全站动画/过渡压到最短 */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}

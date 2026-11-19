@@ -259,9 +259,9 @@
                             </svg>
                             剩余价值 (RMB)
                         </h2>
-                        <div class="result-amount-row flex min-w-0 items-baseline justify-end gap-0.5 md:gap-1">
+                        <div class="result-amount-row flex min-w-0 items-baseline justify-end gap-0.5 md:gap-1" aria-live="polite">
                             <span class="text-2xl md:text-3xl text-slate-500 dark:text-zinc-600 font-light transition-colors">¥</span>
-                            <span id="finalValue" role="button" tabindex="0" title="点击复制金额" aria-label="点击复制金额" class="max-w-full text-[clamp(2rem,calc(8.6vw+4px),2.5rem)] md:text-[68px] font-bold tabular-nums value-glow tracking-normal leading-none transition-colors whitespace-nowrap cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/30">0.00</span>
+                            <span id="finalValue" role="button" tabindex="0" title="点击复制金额" class="max-w-full text-[clamp(2rem,calc(8.6vw+4px),2.5rem)] md:text-[68px] font-bold tabular-nums value-glow tracking-normal leading-none transition-colors whitespace-nowrap cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/30">0.00</span>
                         </div>
                         <div class="amount-copy-row mt-1 flex items-center justify-end gap-5 leading-none min-w-0">
                             <span id="amountCopyTip" class="amount-copy-tip shrink-0 rounded bg-amber-500 px-2.5 py-1 text-[11px] leading-none text-white shadow-md pointer-events-none">金额已复制</span>
@@ -337,7 +337,7 @@
                     </button>
                 </div>
                 
-                <div id="toast" class="absolute bottom-16 left-1/2 -translate-x-1/2 bg-amber-500 text-white dark:text-black text-xs font-bold px-3 py-1.5 rounded shadow-lg pointer-events-none z-20 transition-colors">已复制到剪贴板</div>
+                <div id="toast" role="status" aria-live="polite" class="absolute bottom-16 left-1/2 -translate-x-1/2 bg-amber-500 text-white dark:text-black text-xs font-bold px-3 py-1.5 rounded shadow-lg pointer-events-none z-20 transition-colors">已复制到剪贴板</div>
             </section>
         </div>
 

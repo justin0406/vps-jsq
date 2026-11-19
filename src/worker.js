@@ -3,24 +3,25 @@
  *
  * 路由：
  *   GET  /api/share       健康检查：返回 { ok }，前端据此决定是否显示「复制图片链接」
- *   POST /api/share       上传 WebP/PNG，返回 { url }，图片存进 KV（SHARE_KV），1 年后自动过期
- *   GET  /i/<id>          直接返回图片字节，长缓存，可当 <img src> / og:image 用
+ *   POST /api/share       上传 WebP/PNG，返回 { url }，图片存进 KV（SHARE_KV），90 天后自动过期
+ *   GET  /i/<id>          直接返回图片字节，缓存期与 KV TTL 对齐，可当 <img src> / og:image 用
  *   其余                   交给静态资源
  *
  * 未绑定 SHARE_KV 时，/api/share 一律返回 ok:false（站点本身不受影响）。
  */
 
 // 单图上限 512KB：前端实测导出 84~120KB，留 4 倍余量；
-// 同时保证「日上限 × 保留天数 × 单图上限」不超过免费 1GB（20 × 90 × 512KB ≈ 900MB）
+// 同时把「日上限 × 保留天数 × 单图上限」控制在免费 1GB 内（20 × 90 × 512KB ≈ 900MB）
 const MAX_BYTES = 512 * 1024;
 const MIN_BYTES = 1024;
-// 保留 90 天：分享链接够用，同时把存储上限锁在「全站日上限 × 90 × 单图体积」。
+// 保留 90 天：分享链接够用，同时把存储上限压在「全站日上限 × 90 × 单图体积」内。
 // 免费版 KV 只有 1GB，实测分享图 84~120KB，正常用量 90 天约 100~200MB。
 const TTL_SECONDS = 90 * 24 * 60 * 60;
 const ALLOWED_TYPES = new Set(['image/webp', 'image/png', 'image/jpeg']);
 // 单 IP 每天 10 张：正常自己用远超不出，脚本刷的话单 IP 伤害有限
 const RATE_LIMIT_PER_IP_PER_DAY = 10;
-// 全站每天 20 张：兜底闸门。20 × 90 天 × 512KB ≈ 900MB，硬上限锁死在免费 1GB 内
+// 全站每天 20 张：兜底闸门。KV 计数是读改写且最终一致，只能算软上限
+// （并发会漏计数），主防护靠单 IP 限额；20 × 90 天 × 512KB ≈ 900MB 落在 1GB 内
 const DAILY_UPLOAD_CAP = 20;
 
 function json(body, status = 200) {
@@ -64,14 +65,34 @@ async function handleUpload(request, env, url) {
         return json({ ok: false, error: '仅支持 webp / png / jpeg' }, 415);
     }
 
+    // 有 content-length 就先快速拒绝（省一次完整传输）；chunked 请求没有该头，
+    // 不能依赖它——下面流式读取并累计，超限立即 abort，
+    // 避免把整个 body 读进内存后才拒绝（Worker 内存上限 128MB）。
     const declared = Number(request.headers.get('content-length') || 0);
     if (declared > MAX_BYTES) return json({ ok: false, error: '图片过大（上限 512KB）' }, 413);
 
-    const buf = await request.arrayBuffer();
-    if (buf.byteLength < MIN_BYTES) return json({ ok: false, error: '图片为空' }, 400);
-    if (buf.byteLength > MAX_BYTES) return json({ ok: false, error: '图片过大（上限 512KB）' }, 413);
+    let size = 0;
+    const chunks = [];
+    const reader = request.body.getReader();
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > MAX_BYTES) {
+            try { await reader.cancel(); } catch (_) { /* 已超限，尽快返回 */ }
+            return json({ ok: false, error: '图片过大（上限 512KB）' }, 413);
+        }
+        chunks.push(value);
+    }
+    const buf = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+        buf.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    if (size < MIN_BYTES) return json({ ok: false, error: '图片为空' }, 400);
 
-    // 两道限额：单 IP 每天 10 张 + 全站每天 30 张，防止被脚本刷爆免费额度
+    // 两道限额：单 IP 每天 10 张 + 全站每天 20 张，防止被脚本刷爆免费额度
     const day = new Date().toISOString().slice(0, 10);
     const ipKey = `rl:ip:${day}:${clientIp(request)}`;
     const dayKey = `rl:day:${day}`;
@@ -132,7 +153,9 @@ async function handleImage(request, env, ctx, id) {
     const res = new Response(value, {
         headers: {
             'content-type': metadata?.type || 'image/webp',
-            'cache-control': 'public, max-age=31536000, immutable',
+            // 缓存期与 KV TTL 对齐：KV 条目 90 天过期后，边缘缓存不应继续
+            // 提供超过 TTL 的副本（此前 max-age=31536000 会让「90 天后消失」失效）
+            'cache-control': `public, max-age=${TTL_SECONDS}, immutable`,
             'access-control-allow-origin': '*',
             'x-share-cache': 'miss'
         }

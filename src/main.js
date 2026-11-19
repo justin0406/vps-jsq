@@ -39,6 +39,7 @@ const currencySymbols = {
 };
 
 const els = {
+    calcForm: document.getElementById('calcForm'),
     price: document.getElementById('price'),
     currency: document.getElementById('currency'),
     cycles: document.getElementsByName('cycle'),
@@ -74,18 +75,30 @@ let quoteLastEdited = 'premium';
 let rateCurrency = '';
 // 用户是否手动改过汇率：手动值刷新页面后应保留，不能被缓存汇率覆盖。
 let rateIsManual = false;
+// API 原始汇率（未截断到 4 位）与归属币种：输入框只是展示值，计算优先用原始值，
+// 否则 KRW（1 CNY ≈ 195）这类币种会被 toFixed(4) 吃掉约 0.5% 精度。
+let apiRate = 0;
+let apiRateBase = '';
+// calculate() 的结构化结果：copyResult 从这里取数，不再解析 DOM 文本
+// （空汇率时 DOM 里是「请填写汇率」，老实现会把这句话原样复制进 Markdown）
+let lastCalc = null;
 
 window.addEventListener('DOMContentLoaded', () => {
     try {
         initTheme();
-        loadInputsFromCookie(); 
+        loadInputsFromCookie();
         initQuoteFields();
-        initDates(); 
+        initDates();
         syncDateDisplay(els.dueDate);
         syncDateDisplay(els.tradeDate);
-        initRates(); 
+        initRates();
         setupEventListeners();
-        calculate(); 
+        calculate();
+    } catch (e) {
+        // cookie 里的畸形数据等初始化异常不能让页面停在无响应的骨架上：
+        // 至少把错误说出来，事件绑定失败的兜底交给用户刷新
+        console.error('init failed', e);
+        showToast('初始化失败，请刷新页面重试');
     } finally {
         hideAppLoader();
     }
@@ -111,6 +124,12 @@ function hideAppLoader() {
 
 function setupEventListeners() {
     const debouncedSave = debounce(saveInputsToCookie, 500);
+
+    // 无 action 的 form：在输入框按 Enter 会触发隐式提交，整页 GET 重载并丢失
+    // 溢出状态/焦点/滚动位置。这里不需要表单语义，拦掉默认提交即可。
+    if (els.calcForm) {
+        els.calcForm.addEventListener('submit', (e) => e.preventDefault());
+    }
 
     [els.price, els.dueDate, els.tradeDate, els.customRate].forEach(el => el.addEventListener('input', () => {
         if (el.type === 'date') syncDateDisplay(el);
@@ -224,8 +243,11 @@ function setupEventListeners() {
 function validateNumberInput(el) {
     const raw = el.value.trim();
     if (raw === '') {
-        el.classList.remove('input-invalid');
-        return true;
+        // type=number 的 bad input（德语区逗号小数等）：视觉上有内容但 .value 是
+        // 空串，不能当合法空值放行，否则价格会静默按 0 计算
+        const bad = !!(el.validity && el.validity.badInput);
+        el.classList.toggle('input-invalid', bad);
+        return !bad;
     }
     const v = parseFloat(raw);
     const ok = Number.isFinite(v) && v >= 0;
@@ -369,18 +391,22 @@ function getCookie(name) {
         }
     }
 
-    const cname = name + "=";
-    const decodedCookie = decodeURIComponent(document.cookie);
-    const ca = decodedCookie.split(';');
-    for(let i = 0; i <ca.length; i++) {
-        let c = ca[i];
-        while (c.charAt(0) == ' ') {
-            c = c.substring(1);
+    // document.cookie 兼容路径里的历史数据可能含畸形百分号序列，decodeURIComponent
+    // 抛出的 URIError 不能外溢（初始化链上的每个消费方都会被打断）
+    try {
+        const cname = name + "=";
+        const decodedCookie = decodeURIComponent(document.cookie);
+        const ca = decodedCookie.split(';');
+        for(let i = 0; i <ca.length; i++) {
+            let c = ca[i];
+            while (c.charAt(0) == ' ') {
+                c = c.substring(1);
+            }
+            if (c.indexOf(cname) == 0) {
+                return c.substring(cname.length, c.length);
+            }
         }
-        if (c.indexOf(cname) == 0) {
-            return c.substring(cname.length, c.length);
-        }
-    }
+    } catch (e) { /* 非法编码：当无历史数据处理 */ }
     return "";
 }
 
@@ -438,8 +464,12 @@ async function encodeCardImage(canvas) {
         } catch (_) { /* 继续降 */ }
     }
 
-    // 兜底：交原图 JPEG 0.7，让服务端给出明确拒绝原因
-    return canvasToBlob(canvas, 'image/jpeg', 0.7);
+    // 兜底仍超限：明确报错让用户缩短内容，而不是把超限 blob 交给服务端吃 413
+    const finalBlob = await canvasToBlob(canvas, 'image/jpeg', 0.7);
+    if (finalBlob.size > limit) {
+        throw new Error('内容过长，图片压缩后仍超上限，请缩短金额或备注');
+    }
+    return finalBlob;
 }
 
 function resetGeneratedImage() {
@@ -678,7 +708,7 @@ async function initRates() {
     }
 
     if (base === 'CNY') {
-        finishRateUpdate(1);
+        finishRateUpdate(1, base);
         return;
     }
 
@@ -688,7 +718,7 @@ async function initRates() {
     if (cachedData) {
         try {
             const data = JSON.parse(cachedData);
-            finishRateUpdate(data.rate);
+            finishRateUpdate(data.rate, base);
         } catch (e) {
             manualRefreshRate(false);
         }
@@ -730,6 +760,8 @@ async function manualRefreshRate(isUserClick = true) {
 }
 
 async function fetchExchangeRate() {
+    // base 必须在 await 之前捕获并贯穿到底：慢网下用户切走币种后，过期的响应
+    // 若还按「当前币种」写回，旧汇率会静默套在新币种上算出错误金额。
     const base = els.currency.value;
     els.refreshIcon.classList.add('spin');
     els.apiRateDisplay.textContent = "刷新中";
@@ -737,13 +769,19 @@ async function fetchExchangeRate() {
     try {
         const response = await fetch(API_URL);
         const data = await response.json();
-        
+
+        // 响应回来时币种已切换：丢弃这个过期结果（新一轮请求已在路上）
+        if (els.currency.value !== base) {
+            els.refreshIcon.classList.remove('spin');
+            return;
+        }
+
         if (data.result === "success") {
             const baseInCNY = data.rates && data.rates[base];
             if (typeof baseInCNY === 'number' && baseInCNY > 0 && Number.isFinite(baseInCNY)) {
                 const rate = 1 / baseInCNY;
-                finishRateUpdate(rate);
-                
+                finishRateUpdate(rate, base);
+
                 const cacheData = JSON.stringify({ rate: rate, time: Date.now() });
                 setCookie(`vps_rate_${base}`, cacheData, RATE_CACHE_HOURS);
                 saveInputsToCookie();
@@ -757,10 +795,12 @@ async function fetchExchangeRate() {
         console.error(error);
         els.apiRateDisplay.textContent = "汇率刷新";
         els.refreshIcon.classList.remove('spin');
-        // 手上的汇率属于上一个币种：留着算出来的结果是错的，清空并提示手动填写
-        if (rateCurrency !== els.currency.value) {
+        // 用捕获的 base 判断归属：此时读当前币种不可信
+        if (rateCurrency !== base) {
             els.customRate.value = '';
             rateCurrency = '';
+            apiRate = 0;
+            apiRateBase = '';
             calculate();
             showToast("获取汇率失败，请手动填写");
         } else {
@@ -769,9 +809,11 @@ async function fetchExchangeRate() {
     }
 }
 
-function finishRateUpdate(rate) {
+function finishRateUpdate(rate, base) {
+    apiRate = rate;
+    apiRateBase = base;
     els.customRate.value = rate.toFixed(4);
-    rateCurrency = els.currency.value;
+    rateCurrency = base;
     rateIsManual = false;
     els.apiRateDisplay.textContent = "汇率刷新";
     els.refreshIcon.classList.remove('spin');
@@ -852,9 +894,13 @@ function updateCurrencySymbol() {
 
 function calculate() {
     const priceRaw = parseFloat(els.price.value);
-    const rateRaw = parseFloat(els.customRate.value);
     const price = Number.isFinite(priceRaw) && priceRaw >= 0 ? priceRaw : 0;
-    const rate = Number.isFinite(rateRaw) && rateRaw > 0 ? rateRaw : 0;
+    // 汇率来源：API 原始精度（apiRate，归属币种匹配且非手动输入）优先；
+    // 手动输入或无 API 值时回退到输入框。
+    const rateRaw = parseFloat(els.customRate.value);
+    const rate = rateIsManual || !(apiRateBase === els.currency.value && apiRate > 0)
+        ? (Number.isFinite(rateRaw) && rateRaw > 0 ? rateRaw : 0)
+        : apiRate;
 
     let cycleDays = 365;
     for (const radio of els.cycles) {
@@ -875,6 +921,7 @@ function calculate() {
 
     // 空 / 非法日期：清空结果区，给出占位提示
     if (!result) {
+        lastCalc = null;
         remainingValueCNY = 0;
         setFinalValueDisplay('0.00');
         els.originalCurrencyValue.textContent = '请填写到期日 / 交易日';
@@ -888,6 +935,28 @@ function calculate() {
     els.progressBar.style.width = `${result.barPct}%`;
     remainingValueCNY = result.valueCNY;
     setFinalValueDisplay(result.valueCNY.toFixed(2));
+
+    // 结构化留存：copyResult 只从这里取数
+    let cycleText = "年付";
+    for (const radio of els.cycles) {
+        if (radio.checked) {
+            cycleText = radio.parentElement.innerText.trim();
+            break;
+        }
+    }
+    lastCalc = {
+        price,
+        currency: els.currency.value,
+        rate,
+        days: result.days,
+        valueCNY: result.valueCNY,
+        valueOrig: result.valueOrig,
+        cycleText,
+        premium: els.premiumInput.value || '0.00',
+        salePrice: els.salePriceInput.value || '',
+        tradeDate: els.tradeDate.value,
+        dueDate: els.dueDate.value,
+    };
 
     // 汇率为空（如切币种后拉取失败）：提示补汇率，而不是给出 0 元
     if (rate === 0 && price > 0 && els.currency.value !== 'CNY') {
@@ -910,33 +979,23 @@ function setFinalValueDisplay(value) {
 }
 
 function copyResult() {
-    const price = els.price.value || "0";
-    const currency = els.currency.value;
-    const rate = els.customRate.value || "0";
-    const days = els.daysRemaining.textContent;
-    const valCNY = els.finalValue.textContent;
-    const valOrig = els.originalCurrencyValue.textContent.replace('≈', '').trim().split(' ')[0];
-    const premium = els.premiumInput.value || '0.00';
-    const salePrice = els.salePriceInput.value || valCNY;
-    const tradeDate = els.tradeDate.value;
-    const dueDate = els.dueDate.value;
-    
-    let cycleText = "年付";
-    for (const radio of els.cycles) {
-        if (radio.checked) { 
-            cycleText = radio.parentElement.innerText.trim();
-            break; 
-        }
+    const c = lastCalc;
+    // 汇率为空/日期不全时 DOM 文本是提示语，老实现会把它和 NaN 一起复制出去
+    if (!c || !(c.rate > 0)) {
+        showToast('请先填写完整价格与汇率');
+        return;
     }
-
-    const cnyPrice = (parseFloat(price) * parseFloat(rate)).toFixed(2);
+    // KRW 这类小汇率：4 位小数丢失精度，展示用 6 位有效数字
+    const rateText = c.rate >= 0.01 ? c.rate.toFixed(4) : c.rate.toPrecision(6);
+    const cnyPrice = (c.price * c.rate).toFixed(2);
+    const salePrice = c.salePrice || c.valueCNY.toFixed(2);
     const md = `## 🐔 VPS 剩余价值
-- 📅 交易日期：${tradeDate}
-- 💹 外币汇率：1 ${currency} ≈ ${rate} CNY
-- 💰 续费价格：${price} ${currency}/${cycleText}（约 ${cnyPrice} 元）
-- ⏳ 剩余天数：${days}天（${dueDate} 到期）
-- 💎 剩余价值：${valCNY}元（约 ${valOrig} ${currency}）
-- 🧾 溢价 / 总价：${premium}元 / ${salePrice}元`;
+- 📅 交易日期：${c.tradeDate}
+- 💹 外币汇率：1 ${c.currency} ≈ ${rateText} CNY
+- 💰 续费价格：${c.price} ${c.currency}/${c.cycleText}（约 ${cnyPrice} 元）
+- ⏳ 剩余天数：${c.days}天（${c.dueDate} 到期）
+- 💎 剩余价值：${c.valueCNY.toFixed(2)}元（约 ${c.valueOrig.toFixed(2)} ${c.currency}）
+- 🧾 溢价 / 总价：${c.premium}元 / ${salePrice}元`;
 
     copyTextToClipboard(md, flashCopyButton);
 }
@@ -995,19 +1054,55 @@ const modal = {
     el: document.getElementById('imageModal'),
     img: document.getElementById('generatedImage'),
     loading: document.getElementById('modalLoading'),
-    actions: document.getElementById('modalActions')
+    actions: document.getElementById('modalActions'),
+    close: document.getElementById('closeImageModalBtn')
 };
+
+// 关闭动画的定时器：重新生成/重开模态框时必须先取消，否则挂起的回调会在
+// 生成过程中把模态框藏掉并清空图片
+let modalCloseTimer = null;
+
+function openImageModal() {
+    if (modalCloseTimer) { clearTimeout(modalCloseTimer); modalCloseTimer = null; }
+    modal.el.classList.remove('hidden');
+    // Force reflow
+    void modal.el.offsetWidth;
+    modal.el.classList.add('opacity-100');
+    // 焦点进对话框：读屏/键盘用户不会停留在背景内容上
+    modal.close?.focus();
+    document.addEventListener('keydown', trapModalFocus);
+}
 
 function closeImageModal() {
     modal.el.classList.remove('opacity-100');
-    setTimeout(() => {
+    document.removeEventListener('keydown', trapModalFocus);
+    if (modalCloseTimer) clearTimeout(modalCloseTimer);
+    modalCloseTimer = setTimeout(() => {
+        modalCloseTimer = null;
         modal.el.classList.add('hidden');
         modal.img.classList.add('hidden');
         modal.actions.classList.add('hidden');
         modal.loading.classList.remove('hidden');
         modal.img.src = '';
         resetGeneratedImage();
+        els.imgBtn?.focus();
     }, 300);
+}
+
+// 对话框内的 Tab 焦点循环：焦点不会落到被 backdrop 遮住的背景元素上
+function trapModalFocus(e) {
+    if (e.key !== 'Tab' || modal.el.classList.contains('hidden')) return;
+    const focusables = [...modal.el.querySelectorAll('button:not([disabled])')];
+    if (!focusables.length) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+    }
 }
 
 // Close modal on background click
@@ -1016,13 +1111,9 @@ modal.el.addEventListener('click', (e) => {
 });
 
 async function generateImage() {
-    
     // Show modal immediately to indicate processing
-    modal.el.classList.remove('hidden');
-    // Force reflow
-    void modal.el.offsetWidth;
-    modal.el.classList.add('opacity-100');
-    
+    openImageModal();
+
     // Use setTimeout to allow UI to update before heavy lifting
     setTimeout(async () => {
         const node = document.getElementById('captureRoot');
@@ -1058,7 +1149,8 @@ async function generateImage() {
                 pixelRatio,
                 filter: (element) => {
                     if (!element || !element.id) return true;
-                    return !['themeToggle', 'btnContainer', 'footerWrap'].includes(element.id);
+                    // toast / 限流提示 / 金额复制提示都浮在结果区上方，不排除会烙进分享图
+                    return !['themeToggle', 'btnContainer', 'footerWrap', 'toast', 'rateLimitTip', 'amountCopyTip'].includes(element.id);
                 },
                 style: {
                     transform: 'scale(1)',
@@ -1076,7 +1168,7 @@ async function generateImage() {
         } catch (e) {
             console.error('Synchronous error during image generation:', e);
             closeImageModal();
-            showToast('生成出错');
+            showToast(e && e.message ? String(e.message) : '生成出错');
         } finally {
             restoreSelectInputs();
             restoreNumberInputs();
